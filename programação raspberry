@@ -1,0 +1,259 @@
+#include <stdio.h>
+#include "TFT_eSPI.h"  // https://github.com/Bodmer/TFT_eSPI
+#include <WiFiEspAT.h> // https://github.com/jandrassy/WiFiEspAT
+#include "OneButton.h" // https://github.com/mathertel/OneButton
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "MAX30100_PulseOximeter.h"
+#include <Wire.h>
+#include "picoImage.h"
+#define PIN_TFT_BL 4
+#define PIN_PWR_ON 22
+#define PIN_BOTTON1 6
+#define PIN_BOTTON2 7
+#define PIN_RED_LED 25
+#define PIN_BAT_VOLT 26
+#define I2C_SDA 12
+#define I2C_SCL 13
+#define ESP32C3_RX_PIN 9
+#define ESP32C3_TX_PIN 8
+#define REPORTING_PERIOD_MS   500
+#define VOLT_COMPENSATOR      0.05
+#define CONVERSION_FACTOR     3.3f / (1 << 12)
+#define RESPONSE_BUFFER_SIZE  128
+#define RESPONSE_TIMEOUT      1000
+PulseOximeter pox;
+OneButton button_IO6(PIN_BOTTON1, true);
+OneButton button_IO7(PIN_BOTTON2, true);
+TFT_eSPI tft = TFT_eSPI(135, 240);
+uint32_t tsLastReport = 0;
+bool ageChange = true;
+bool ageRefresh = true;
+bool danger = false;
+static uint32_t ageScreenTimeout = 0;
+static uint32_t startTime = 0;
+unsigned int age = 20;
+int heartRate = 0;
+int counts = 0;
+char responseBuffer[RESPONSE_BUFFER_SIZE];
+bool sendATCommandAndGetResponse(const char* command, char* responseBuffer, size_t bufferSize);
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_PWR_ON, OUTPUT);
+  digitalWrite(PIN_PWR_ON, HIGH);
+  Serial2.setTX(ESP32C3_TX_PIN);
+  Serial2.setRX(ESP32C3_RX_PIN);
+  Serial2.begin(115200);
+  adc_init();
+  adc_gpio_init(PIN_BAT_VOLT);
+  adc_select_input(0);
+  button_IO6.attachClick(io6_click_event_cb);
+  button_IO7.attachClick(io7_click_event_cb);
+  pinMode(PIN_RED_LED, OUTPUT);
+  pinMode(PIN_TFT_BL, OUTPUT);
+  digitalWrite(PIN_TFT_BL, 0);
+  tft.init();
+  tft.fillScreen(TFT_BLACK);
+  tft.setRotation(1);
+  tft.setSwapBytes(true);
+  tft.pushImage(0, 0, 240, 135, pico);
+  analogWrite(PIN_TFT_BL, 0);
+  for (int i = 0; i < 0xff; i++) {
+    delay(5);
+    analogWrite(PIN_TFT_BL, i);
+  }
+  delay(1000);
+  bool success = sendATCommandAndGetResponse("AT", responseBuffer, sizeof(responseBuffer));
+  int tries;
+  for (tries = 0; tries < 3; tries++) {
+    success = sendATCommandAndGetResponse("AT", responseBuffer, sizeof(responseBuffer));
+    if (success) {
+      if (strncmp(responseBuffer, "OK", 2) == 0) {
+        Serial.println("ESP OK!");
+        break;
+      }
+    }
+  }
+  if (tries == 3) {
+  }
+  for (tries = 0; tries < 3; tries++) {
+    success = sendATCommandAndGetResponse("AT+SCAN:1", responseBuffer, sizeof(responseBuffer));
+    if (success) {
+      if (strncmp(responseBuffer, "AT+SCAN:OK", 10) == 0) {
+        Serial.println("SCAN STARTED");
+        break;
+      }
+    }
+  }
+  tft.setTextSize(2);
+  int16_t x = (tft.width() - tft.textWidth("Buscando esteiras")) / 2;
+  int16_t y = ((tft.height() - tft.fontHeight(2)) / 2) + 30;
+  tft.setTextColor(TFT_WHITE);
+  delay(1000);
+  while (1) {
+    tft.setCursor(x, y);
+    tft.print("Buscando esteiras");
+    delay(600);
+    tft.fillRect(x, y, tft.textWidth("Buscando esteiras"), tft.fontHeight(2), TFT_BLACK); // Clear the text area
+    success = sendATCommandAndGetResponse("AT+CONNECTED?", responseBuffer, sizeof(responseBuffer));
+    Serial.println(responseBuffer);
+    if (success) {
+      if (strncmp(responseBuffer, "AT+CONNECTED:1", 14) == 0) {
+        Serial.println("Esteira conectada!");
+        break;
+      }
+    }
+  }
+  tft.setTextSize(2);
+  x = (tft.width() - tft.textWidth("Conectando...")) / 2;
+  y = ((tft.height() - tft.fontHeight(2)) / 2) + 30;
+  tft.setTextColor(TFT_BLUE);
+  for (int i = 0; i < 2; i++) {
+    tft.setCursor(x, y);
+    tft.print("Conectando...");
+    delay(200);
+    tft.fillRect(x, y, tft.textWidth("Conectando..."), tft.fontHeight(2), TFT_BLACK); // Clear the text area
+    // delay(200);
+    tft.setCursor(x, y);
+    tft.print("Conectando.");
+    delay(200);
+    tft.setCursor(x, y);
+    tft.print("Conectando..");
+    delay(200);
+  }
+  tft.fillRect(x, y, tft.textWidth("Conectando..."), tft.fontHeight(2), TFT_BLACK); // Clear the text area
+  tft.setTextSize(4);
+  x = (tft.width() - tft.textWidth("CONECTADO!")) / 2;
+  y = tft.height() / 2;
+  tft.setTextColor(TFT_GREEN);
+  tft.setCursor(x, y);
+  tft.print("CONECTADO!");
+  delay(500);
+  ageScreenTimeout = millis();
+  startTime = millis();
+  Wire.setSDA(I2C_SDA);
+  Wire.setSCL(I2C_SCL);
+  if (!pox.begin()) {
+    Serial.println("FAILED");
+    for (;;);
+  } else {
+    Serial.println("SUCCESS");
+  }
+}
+void loop() {
+  pox.update();
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+    heartRate = (int) pox.getHeartRate();
+    Serial.print("Heart rate:");
+    Serial.print(pox.getHeartRate());
+    Serial.print("bpm / SpO2:");
+    Serial.print(pox.getSpO2());
+    Serial.println("%");
+    tsLastReport = millis();
+    if(heartRate > (220 - age)){
+      if(counts == 3){
+        danger = true;
+        sendATCommandAndGetResponse("AT+STOP", responseBuffer, sizeof(responseBuffer));
+      }else{
+        counts++;
+      }
+    }else{
+      counts = 0;
+    }
+  }
+  if (danger == false) {
+    button_IO6.tick();
+    button_IO7.tick();
+    if (ageChange == true) {
+      if ((millis() - ageScreenTimeout) > 3000) {
+        ageChange = false;
+      }
+      if(ageRefresh == true){
+        ageRefresh = false;
+        tft.fillScreen(TFT_BLACK); // Clear the screen junk
+        tft.setTextSize(4);
+        int16_t x = tft.width() / 2;
+        int16_t y = (tft.height() / 2);
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("Idade: " + String(age), x, y);
+      }
+    } else {
+      tft.fillScreen(TFT_BLACK); 
+      tft.setTextSize(4);
+      int16_t x = (tft.width() - tft.textWidth("BPM: 00")) / 2;
+      int16_t y = 0;
+      tft.setTextColor(TFT_WHITE);
+      tft.setCursor(x, y);
+      tft.print("BPM: " + String(heartRate));
+      tft.setTextSize(2);
+      x = (tft.width() - tft.textWidth("BPM max.: 98")) / 2;
+      y = (tft.height() / 2);
+      tft.setTextColor(TFT_WHITE);
+      tft.setCursor(x, y);
+      tft.print("BPM max.: " + String(220 - age));
+      uint32_t tempo = millis() - startTime;
+      int minuto = (tempo / 1000) / 60;
+      int segundos = (tempo / 1000) % 60;
+      tft.setTextSize(2);
+      x = (tft.width() - tft.textWidth("Tempo: 00:00")) / 2;
+      y = (tft.height() / 2) + tft.fontHeight(4);
+      tft.setTextColor(TFT_WHITE);
+      tft.setCursor(x, y);
+      char buffer[40];
+      sprintf(buffer, "Tempo: %02d:%02d", minuto, segundos);
+      tft.print(buffer);
+    }
+  } else {
+    tft.fillScreen(TFT_BLACK); 
+    tft.setTextSize(4);
+    int16_t x = tft.width() / 2;
+    int16_t y = (tft.height() / 2);
+    tft.setTextColor(TFT_RED);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("PERIGO!", x, y);
+    tft.setTextSize(2);
+    x = tft.width() / 2;
+    y = (tft.height() / 2) + tft.fontHeight(2);
+    tft.drawString("bpms elevados", x, y);
+  }
+  delay(50);
+}
+void io6_click_event_cb() {
+  if(age > 0)
+    age -= 1;
+  ageScreenTimeout = millis();
+  ageChange = true;
+  ageRefresh = true;
+}
+void io7_click_event_cb() {
+  if(age < 110)
+    age += 1;
+  ageScreenTimeout = millis();
+  ageChange = true;
+  ageRefresh = true;
+}
+bool sendATCommandAndGetResponse(const char * command, char * responseBuffer, size_t bufferSize) {
+  memset(responseBuffer, 0, bufferSize);
+  Serial2.print(command);
+  Serial2.print("\n");
+  unsigned long startTime = millis(); // Get the current time
+  size_t responseIndex = 0;
+  bool receivedNewline = false;
+  while ((millis() - startTime) < RESPONSE_TIMEOUT) {
+    if (Serial2.available()) {
+      char response = Serial2.read();
+      if (response == '\n') {
+        receivedNewline = true;
+        responseIndex++;
+        break;
+      }
+      if (responseIndex < bufferSize - 1) {
+        responseBuffer[responseIndex] = response;
+        responseIndex++;
+      }
+    }
+  }
+  responseBuffer[responseIndex] = '\0';
+  return receivedNewline;
