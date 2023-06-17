@@ -1,0 +1,187 @@
+
+#include "BLEDevice.h"
+#define RX1_PIN 6
+#define TX1_PIN 7
+#define MAX_MESSAGE_LENGTH 30
+static BLEUUID serviceUUID("1826");
+static BLEUUID    charUUID("2AD9");
+bool isScanning = false;  // Flag to track scanning state
+static boolean doConnect = false;
+static boolean connected = false;
+static boolean doScan = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic;
+static BLEAdvertisedDevice* myDevice;
+static void notifyCallback(
+  BLERemoteCharacteristic* pBLERemoteCharacteristic,
+  uint8_t* pData,
+  size_t length,
+  bool isNotify) {
+    Serial.print("Notify callback for characteristic ");
+    Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
+    Serial.print(" of data length ");
+    Serial.println(length);
+    Serial.print("data: ");
+    Serial.write(pData, length);
+    Serial.println();
+}
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+  }
+  void onDisconnect(BLEClient* pclient) {
+    connected = false;
+    Serial.println("onDisconnect");
+  }
+};
+BLEClient* pClient;
+bool connectToServer() {
+    Serial.print("Forming a connection to ");
+    Serial.println(myDevice->getAddress().toString().c_str());
+    pClient  = BLEDevice::createClient();
+    Serial.println(" - Created client");
+    pClient->setClientCallbacks(new MyClientCallback());
+    pClient->connect(myDevice); 
+    Serial.println(" - Connected to server");
+    pClient->setMTU(517); 
+    BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService == nullptr) {
+      Serial.print("Failed to find our service UUID: ");
+      Serial.println(serviceUUID.toString().c_str());
+      pClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found our service");
+    pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+    if (pRemoteCharacteristic == nullptr) {
+      Serial.print("Failed to find our characteristic UUID: ");
+      Serial.println(charUUID.toString().c_str());
+      pClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found our characteristic");
+    if(pRemoteCharacteristic->canRead()) {
+      std::string value = pRemoteCharacteristic->readValue();
+      Serial.print("The characteristic value was: ");
+      Serial.println(value.c_str());
+    }
+    if(pRemoteCharacteristic->canNotify())
+      pRemoteCharacteristic->registerForNotify(notifyCallback);
+    pRemoteCharacteristic->writeValue(0x00); 
+    connected = true;
+    return true;
+}
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    Serial.print("BLE Advertised Device found: ");
+    Serial.println(advertisedDevice.toString().c_str());
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = true;
+    } 
+  }
+};
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, RX1_PIN, TX1_PIN);
+  Serial.println("Starting Arduino BLE Client application...");
+  BLEDevice::init("");
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+void loop() {
+  while (Serial1.available() > 0) {
+    static char message[MAX_MESSAGE_LENGTH];
+    static unsigned int message_pos = 0;
+    char inByte = Serial1.read();
+    Serial.println(inByte);
+    if (inByte != '\n' && (message_pos < MAX_MESSAGE_LENGTH - 1)) {
+      message[message_pos] = inByte;
+      message_pos++;
+    } else {
+      message[message_pos] = '\0';
+      Serial.println(message);
+      delay(10);
+      processBuffer(message);
+      message_pos = 0;
+    }
+  }
+  if (doConnect == true) {
+    isScanning = false;
+    if (connectToServer()) {
+      Serial.println("We are now connected to the BLE Server.");
+    } else {
+      Serial.println("We have failed to connect to the server; there is nothin more we will do.");
+    }
+    doConnect = false;
+  }
+}
+void processBuffer(char* buffer) {
+  if (strcmp(buffer, "AT") == 0) {
+    Serial.println("OK");
+    Serial1.println("OK");
+  } else if (strncmp(buffer, "AT+SCAN:", 8) == 0) {
+    char* value = buffer + 8;
+    if (strcmp(value, "0") == 0) {
+      if (isScanning) {
+        BLEDevice::getScan()->stop();
+        isScanning = false;
+        Serial.println("AT+SCAN:OK");
+        Serial1.println("AT+SCAN:OK");
+      }
+    } else if (strcmp(value, "1") == 0) {
+      if (!isScanning) {
+        BLEDevice::getScan()->start(0);
+        isScanning = true;
+        Serial.println("AT+SCAN:OK");
+        Serial1.println("AT+SCAN:OK");
+      } else {
+        Serial.println("AT+SCAN:Already scanning");
+        Serial1.println("AT+SCAN:Already scanning");
+      }
+    }
+  } else if (strcmp(buffer, "AT+CONNECTED?") == 0) {
+    Serial.println(connected ? "AT+CONNECTED:1" : "AT+CONNECTED:0");
+    Serial1.println(connected ? "AT+CONNECTED:1" : "AT+CONNECTED:0");
+  } else if (strcmp(buffer, "AT+DISCONNECT") == 0) {
+    if (pClient->isConnected()) {
+      pClient->disconnect();
+      connected = false;
+      Serial.println("AT+DISCONNECT:OK");
+      Serial1.println("AT+DISCONNECT:OK");
+    } else {
+      Serial.println("AT+DISCONNECT:Not connected");
+      Serial1.println("AT+DISCONNECT:Not connected");
+    }
+  } else if (strncmp(buffer, "AT+SEND:", 8) == 0) {
+    char* payload = buffer + 8; 
+    pRemoteCharacteristic->writeValue(0x08); 
+    Serial.println("AT+SEND:OK");
+    Serial1.println("AT+SEND:OK");
+  } else if (strcmp(buffer, "AT+RESET") == 0) {
+    Serial.println("AT+RESET:OK");
+    Serial1.println("AT+RESET:OK");
+    ESP.restart();
+  } else if (strcmp(buffer, "AT+CTRL") == 0) {
+    Serial.println("AT+CTRL:OK");
+    pRemoteCharacteristic->writeValue(0x00);
+  } else if (strcmp(buffer, "AT+START") == 0) {
+    Serial.println("AT+START:OK");
+    pRemoteCharacteristic->writeValue(0x07);  
+  } else if (strcmp(buffer, "AT+STOP") == 0) {
+    Serial.println("AT+STOP:OK");
+    uint8_t sendData[] = {0x08, 0x01};
+    size_t sendLength = sizeof(sendData) / sizeof(sendData[0]);
+    pRemoteCharacteristic->writeValue(sendData, sendLength);
+  } else {
+    Serial.println("ERR");
+    Serial1.print("ERR:");
+    Serial1.print(buffer);
+    Serial1.println("\END/");
+  }
+}
+
+
+
